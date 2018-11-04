@@ -7,11 +7,11 @@ import asyncio
 import json
 import logging
 import sys
-import traceback
 
 import config
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=getattr(logging, getattr(config, 'LOGLEVEL', 'warning').upper(), logging.WARNING))
+log = logging.getLogger(__name__)
 
 
 class RateLimit(object):
@@ -20,7 +20,7 @@ class RateLimit(object):
 
     def __init__(self):
         self.loop = asyncio.get_event_loop()
-        self.loop.set_debug(False)
+        self.loop.set_debug(log.getEffectiveLevel() <= logging.DEBUG)
 
     def start(self):
         channel = asyncio.Queue()
@@ -61,7 +61,7 @@ class RateLimit(object):
             while True:
                 message = await get()
                 if message.get('type') == 'message':
-                    print(message)
+                    log.info('Message: %s', message)
                     pool = await self.pool
                     nummsgs = await pool.execute('incr', message['user'])
                     if nummsgs == 1:
@@ -70,13 +70,13 @@ class RateLimit(object):
                         self.loop.create_task(self.api_call('chat.delete', {'channel': message['channel'], 'ts': message['ts']}))
                         self.loop.create_task(self.api_call('chat.postMessage', {'channel': message['channel'], 'text': 'test text'}))
                 else:
-                    print(message, file=sys.stderr)
-        except Exception:
-            traceback.print_exc()
+                    log.debug('Debug Message: %s', message)
+        except Exception as exc:
+            log.exception(exc)
 
     async def bot(self, put):
         '''Create a bot that joins Slack.'''
-        rtm = await self.api_call('rtm.start')
+        rtm = await self.api_call('rtm.connect')
         if not rtm['ok']:
             raise Exception('Error connecting to RTM.')
 
@@ -87,7 +87,7 @@ class RateLimit(object):
                         message = json.loads(msg.data)
                         await put(message)
                     else:
-                        print('ERROR')
+                        log.critical('Unexpected Message type %s: %s', msg.type, msg)
                         break
 
 
