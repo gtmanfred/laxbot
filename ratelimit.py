@@ -6,7 +6,9 @@ import aioredis
 import asyncio
 import json
 import logging
+import random
 import sys
+import websockets
 
 import config
 
@@ -17,15 +19,25 @@ log = logging.getLogger(__name__)
 class RateLimit(object):
 
     _pool = None
+    bad_messages = (
+        'bot_message',
+        'message_deleted',
+    )
 
     def __init__(self):
         self.loop = asyncio.get_event_loop()
         self.loop.set_debug(log.getEffectiveLevel() <= logging.DEBUG)
 
-    def start(self):
-        channel = asyncio.Queue()
-        self.loop.create_task(asyncio.wait((self.bot(channel.put), self.consumer(channel.get))))
-        self.loop.run_forever()
+    async def start(self):
+        while True:
+            channel = asyncio.Queue()
+            done, pending = await asyncio.wait(
+                (self.bot(channel.put), self.consumer(channel.get), self.ping()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.sleep(5)
 
     @property
     async def pool(self):
@@ -54,13 +66,24 @@ class RateLimit(object):
                     )
                 return await response.json()
 
+    async def warn_user(self, message):
+        channel = await self.api_call('conversations.info', {'channel': message['channel']})
+        imid = await self.api_call('conversations.open', {'users': [message['user']]})
+        await self.api_call(
+            'chat.postMessage',
+            {
+                'channel': imid['channel']['id'],
+                'text': f'Please slow down. Message removed #{channel["channel"]["name"]}: {message["text"]}',
+            },
+        )
+
     async def consumer(self, get):
         '''Display the message.'''
         message = None
         try:
             while True:
                 message = await get()
-                if message.get('type') == 'message':
+                if message.get('type') == 'message' and message.get('subtype') not in self.bad_messages:
                     log.info('Message: %s', message)
                     pool = await self.pool
                     nummsgs = await pool.execute('incr', message['user'])
@@ -68,11 +91,27 @@ class RateLimit(object):
                         await pool.execute('expire', message['user'], config.MAXTIMEOUT)
                     if nummsgs > config.MAXMSGS:
                         self.loop.create_task(self.api_call('chat.delete', {'channel': message['channel'], 'ts': message['ts']}))
-                        self.loop.create_task(self.api_call('chat.postMessage', {'channel': message['channel'], 'text': 'test text'}))
+                        self.loop.create_task(self.warn_user(message))
+                elif message.get('type') == 'pong':
+                    self.msgid = message['reply_to']
                 else:
                     log.debug('Debug Message: %s', message)
         except Exception as exc:
             log.exception(exc)
+
+    async def ping(self):
+        '''ping websocket'''
+        while not hasattr(self, 'ws'):
+            await asyncio.sleep(1)
+        while True:
+            msgid = random.randrange(10000)
+            try:
+                await self.ws.send(json.dumps({'type': 'ping', 'id': msgid}))
+            except websockets.exceptions.ConnectionClosed:
+                break
+            await asyncio.sleep(20)
+            if msgid != self.msgid:
+                break
 
     async def bot(self, put):
         '''Create a bot that joins Slack.'''
@@ -80,17 +119,11 @@ class RateLimit(object):
         if not rtm['ok']:
             raise Exception('Error connecting to RTM.')
 
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(rtm['url']) as ws:
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.text:
-                        message = json.loads(msg.data)
-                        await put(message)
-                    else:
-                        log.critical('Unexpected Message type %s: %s', msg.type, msg)
-                        break
+        async with websockets.connect(rtm['url']) as self.ws:
+            async for msg in self.ws:
+                await put(json.loads(msg))
 
 
 if __name__ == '__main__':
     bot = RateLimit()
-    bot.start()
+    bot.loop.run_until_complete(bot.start())
