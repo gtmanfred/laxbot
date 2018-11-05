@@ -7,7 +7,6 @@ import asyncio
 import json
 import logging
 import random
-import sys
 
 import config
 
@@ -89,7 +88,9 @@ class RateLimit(object):
                 if nummsgs == 1:
                     await pool.execute('expire', message['user'], config.MAXTIMEOUT)
                 if nummsgs > config.MAXMSGS:
-                    self.loop.create_task(self.api_call('chat.delete', {'channel': message['channel'], 'ts': message['ts']}))
+                    self.loop.create_task(
+                        self.api_call('chat.delete', {'channel': message['channel'], 'ts': message['ts']})
+                    )
                     self.loop.create_task(self.warn_user(message))
             elif message.get('type') == 'pong':
                 self.msgid = message['reply_to']
@@ -104,7 +105,7 @@ class RateLimit(object):
             msgid = random.randrange(10000)
             try:
                 await self.ws.send_str(json.dumps({'type': 'ping', 'id': msgid}))
-            except websockets.exceptions.ConnectionClosed:
+            except RuntimeError:
                 break
             await asyncio.sleep(20)
             if msgid != self.msgid:
