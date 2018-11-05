@@ -8,7 +8,6 @@ import json
 import logging
 import random
 import sys
-import websockets
 
 import config
 
@@ -37,6 +36,8 @@ class RateLimit(object):
             )
             for task in pending:
                 task.cancel()
+            if hasattr(self, 'ws'):
+                del self.ws
             await asyncio.sleep(5)
 
     @property
@@ -79,25 +80,21 @@ class RateLimit(object):
 
     async def consumer(self, get):
         '''Display the message.'''
-        message = None
-        try:
-            while True:
-                message = await get()
-                if message.get('type') == 'message' and message.get('subtype') not in self.bad_messages:
-                    log.info('Message: %s', message)
-                    pool = await self.pool
-                    nummsgs = await pool.execute('incr', message['user'])
-                    if nummsgs == 1:
-                        await pool.execute('expire', message['user'], config.MAXTIMEOUT)
-                    if nummsgs > config.MAXMSGS:
-                        self.loop.create_task(self.api_call('chat.delete', {'channel': message['channel'], 'ts': message['ts']}))
-                        self.loop.create_task(self.warn_user(message))
-                elif message.get('type') == 'pong':
-                    self.msgid = message['reply_to']
-                else:
-                    log.debug('Debug Message: %s', message)
-        except Exception as exc:
-            log.exception(exc)
+        while True:
+            message = await get()
+            if message.get('type') == 'message' and message.get('subtype') not in self.bad_messages:
+                log.info('Message: %s', message)
+                pool = await self.pool
+                nummsgs = await pool.execute('incr', message['user'])
+                if nummsgs == 1:
+                    await pool.execute('expire', message['user'], config.MAXTIMEOUT)
+                if nummsgs > config.MAXMSGS:
+                    self.loop.create_task(self.api_call('chat.delete', {'channel': message['channel'], 'ts': message['ts']}))
+                    self.loop.create_task(self.warn_user(message))
+            elif message.get('type') == 'pong':
+                self.msgid = message['reply_to']
+            else:
+                log.debug('Debug Message: %s', message)
 
     async def ping(self):
         '''ping websocket'''
@@ -106,7 +103,7 @@ class RateLimit(object):
         while True:
             msgid = random.randrange(10000)
             try:
-                await self.ws.send(json.dumps({'type': 'ping', 'id': msgid}))
+                await self.ws.send_str(json.dumps({'type': 'ping', 'id': msgid}))
             except websockets.exceptions.ConnectionClosed:
                 break
             await asyncio.sleep(20)
@@ -119,9 +116,10 @@ class RateLimit(object):
         if not rtm['ok']:
             raise Exception('Error connecting to RTM.')
 
-        async with websockets.connect(rtm['url']) as self.ws:
-            async for msg in self.ws:
-                await put(json.loads(msg))
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(rtm['url']) as self.ws:
+                async for msg in self.ws:
+                    await put(json.loads(msg.data))
 
 
 if __name__ == '__main__':
